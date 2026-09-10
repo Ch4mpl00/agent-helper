@@ -111,8 +111,8 @@ function outputText(gen: Observation): string {
 // hard (5 parallel thinking calls trip its per-minute quota), and the
 // gpt-5.4 judge blows the OpenAI per-minute token budget when several
 // swap-pairs send ~160k-char candidate sets at once. The backoff
-// (3s..48s) outlives a one-minute window.
-function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+// across attempts can outlive a one-minute window.
+function withRetry<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
   return retryOnTransient(fn, { maxRetries: 5, baseDelayMs: 3000 });
 }
 
@@ -123,13 +123,13 @@ async function replayGeneration(
   reasoningEffort?: ReasoningEffort,
 ): Promise<string> {
   const client = clientFor(model);
-  const res = await withRetry(() =>
+  const res = await withRetry((signal) =>
     client.chat.completions.create({
       model,
       messages,
       ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
       ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-    }),
+    }, { signal, maxRetries: 0 }),
   );
   return res.choices[0]?.message.content ?? "";
 }
@@ -567,7 +567,7 @@ async function judgePair(
   digest1: string,
   digest2: string,
 ): Promise<Pairwise> {
-  const res = await withRetry(() =>
+  const res = await withRetry((signal) =>
     openai.chat.completions.create({
       model: JUDGE_MODEL,
       messages: [
@@ -578,7 +578,7 @@ async function judgePair(
         type: "json_schema",
         json_schema: { name: "pairwise", strict: true, schema: PAIRWISE_RESPONSE_SCHEMA },
       },
-    }),
+    }, { signal, maxRetries: 0 }),
   );
   const content = res.choices[0]?.message.content;
   if (!content) throw new Error("pairwise judge returned empty content");

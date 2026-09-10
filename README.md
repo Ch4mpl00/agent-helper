@@ -196,9 +196,20 @@ factory functions (`createXxxModule(deps)`), no singletons, composition root
 in `server.ts main()`. See `services/news/module.ts` for the canonical shape,
 and `CLAUDE.md` for the full rules.
 
+Use **Effect 4** for asynchronous orchestration: parallel tasks with explicit
+concurrency limits, cancellation, timeouts, retries/backoff and resource
+cleanup. Keep child tasks within their parent's lifetime, propagate
+`AbortSignal` to SDK/HTTP calls and await cleanup before closing traces or
+clients. Convert to Promises at public API boundaries. Reuse
+`packages/agent/src/generation.ts` for LLM generation/tracing and
+`providers/retry.ts` for transient failures; automatic retries belong in one
+layer and must not replay tool side effects. See `agent-loop.ts` and
+`workflow/execute.ts` for the parallel execution patterns.
+
 ## Stack
 
 TypeScript (ESM) · [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) ·
+Effect 4 (`effect@4.0.0-rc.113`, pinned) ·
 `better-sqlite3` · Drizzle + pgvector · `googleapis` (Gmail) ·
 gramjs (MTProto userbot) · `cron-parser` · `openai` SDK pointed at DeepSeek ·
 Langfuse tracing · Vitest.

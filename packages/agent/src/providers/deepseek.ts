@@ -57,7 +57,7 @@ export function createDeepseekProvider(client: OpenAI): ChatProvider {
         : { thinking: { type: "disabled" } };
       Object.assign(body, extensions);
 
-      const raw = await client.chat.completions.create(body);
+      const raw = await client.chat.completions.create(body, { signal: params.signal, maxRetries: 0 });
       return toResult(raw, normalizeDeepseekUsage(raw.usage));
     },
   };

@@ -10,7 +10,7 @@ import { MEMORY_KEYS, type MemoryStore } from "./db/memory";
 // read from env ONCE in the composition root and injected here, so this
 // per-signal business path touches no process.env.
 export interface EnvDataDeps {
-  mcp: { callTool(name: string, args: Record<string, unknown>): Promise<string> };
+  mcp: { callTool(name: string, args: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<string> };
   memory: Pick<MemoryStore, "get">;
   userEmail: string | null;
 }
@@ -112,19 +112,22 @@ function formatLocalTime(now: Date, tz: string): string {
 // Reads the integration-owned timezone from MCP exactly once per call.
 // Returns "UTC" if the MCP call fails — the block is best-effort, we'd
 // rather inject a slightly-wrong tz than crash the session.
-async function readTimezone(deps: EnvDataDeps): Promise<string> {
+async function readTimezone(deps: EnvDataDeps, signal?: AbortSignal): Promise<string> {
   try {
-    const raw = await deps.mcp.callTool("get_timezone", {});
+    signal?.throwIfAborted();
+    const raw = await deps.mcp.callTool("get_timezone", {}, { signal });
+    signal?.throwIfAborted();
     if (raw.startsWith("[tool error]")) return "UTC";
     const parsed = JSON.parse(raw) as { timezone?: string };
     return parsed.timezone ?? "UTC";
   } catch {
+    signal?.throwIfAborted();
     return "UTC";
   }
 }
 
-export async function gatherEnvData(deps: EnvDataDeps): Promise<EnvData> {
-  const tz = await readTimezone(deps);
+export async function gatherEnvData(deps: EnvDataDeps, signal?: AbortSignal): Promise<EnvData> {
+  const tz = await readTimezone(deps, signal);
   return {
     now: new Date(),
     timezone: tz,

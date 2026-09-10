@@ -65,7 +65,9 @@ export async function prepareTelegramInput(
   context: SessionContext,
   mcp: Pick<McpHandle, "callTool">,
   trace: TraceContext,
+  abortSignal?: AbortSignal,
 ): Promise<string> {
+  abortSignal?.throwIfAborted();
   if (signal.source !== "telegram") return signal.content;
 
   // This header is emitted by the Telegram poller. Anchor it so quoted text
@@ -82,7 +84,8 @@ export async function prepareTelegramInput(
     const currentText = z.string().parse(JSON.parse(header[3]!));
     const signalTime = timestamp(signal.created_at);
     if (!Number.isFinite(signalTime)) throw new Error("Invalid Telegram signal timestamp");
-    const raw = await mcp.callTool("get_telegram_chat_history", args);
+    const raw = await mcp.callTool("get_telegram_chat_history", args, { signal: abortSignal });
+    abortSignal?.throwIfAborted();
     if (isToolError(raw)) throw new Error(raw);
     const result = historySchema.parse(JSON.parse(raw));
     // Omitted threadId means all topics in the existing MCP API. Keep only
@@ -113,6 +116,7 @@ export async function prepareTelegramInput(
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     span.end({ output: { error }, level: "ERROR", statusMessage: error });
+    abortSignal?.throwIfAborted();
     return unavailable();
   }
 }

@@ -46,7 +46,7 @@ describe("Telegram signal context", () => {
       message(5, "Будущий ответ", { created_at: "2026-09-06 12:00:01" }),
     ]);
     const input = await h.run();
-    expect(h.mcp.callTool).toHaveBeenCalledExactlyOnceWith("get_telegram_chat_history", { chatId: "-10042", threadId: 7, limit: 20 });
+    expect(h.mcp.callTool).toHaveBeenCalledExactlyOnceWith("get_telegram_chat_history", { chatId: "-10042", threadId: 7, limit: 20 }, { signal: undefined });
     expect(input).toContain("Собрать за неделю?");
     expect(input.indexOf("собери сводку")).toBeLessThan(input.indexOf("Собрать за неделю?"));
     expect(input).toContain("memory_key=telegram.history");

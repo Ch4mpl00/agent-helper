@@ -21,7 +21,7 @@ export function createOpenAiProvider(client: OpenAI): ChatProvider {
         ...(hasTools ? { tools: params.tools } : {}),
         ...(params.responseFormat ? { response_format: params.responseFormat } : {}),
       };
-      const raw = await client.chat.completions.create(body);
+      const raw = await client.chat.completions.create(body, { signal: params.signal, maxRetries: 0 });
       return toResult(raw, normalizeOpenAiUsage(raw.usage));
     },
   };

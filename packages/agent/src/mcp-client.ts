@@ -22,7 +22,7 @@ const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
 
 export interface McpHandle {
   tools: ChatCompletionTool[];
-  callTool(name: string, args: Record<string, unknown>): Promise<string>;
+  callTool(name: string, args: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<string>;
   close(): Promise<void>;
 }
 
@@ -258,16 +258,20 @@ export async function connectMcp(options: ConnectMcpOptions = {}): Promise<McpHa
   async function callTool(
     name: string,
     args: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
   ): Promise<string> {
+    options?.signal?.throwIfAborted();
     const used = client;
     let result;
     try {
-      result = await used.callTool({ name, arguments: args });
+      result = await used.callTool({ name, arguments: args }, undefined, options);
     } catch (err) {
+      options?.signal?.throwIfAborted();
       if (!isSessionLostError(err)) throw err;
       console.warn("[mcp-client] session lost, reconnecting…");
       const fresh = await reconnect(used);
-      result = await fresh.callTool({ name, arguments: args });
+      options?.signal?.throwIfAborted();
+      result = await fresh.callTool({ name, arguments: args }, undefined, options);
     }
 
     const parts = Array.isArray(result.content) ? result.content : [];

@@ -5,6 +5,9 @@ import type { Span, Trace, TraceContext } from "./tracing";
 import type { SessionContext } from "./session-context";
 import { isToolError, storeToolResult, WORKING_MEMORY_INSTRUCTIONS } from "./tool-results";
 import { z } from "zod";
+import { Cause, Effect, Exit } from "effect";
+import { generationEffect } from "./generation";
+import { toError } from "./errors";
 import {
   INVOKE_SUB_AGENT_TOOL_NAME,
   SYNTHETIC_TOOLS,
@@ -18,11 +21,17 @@ import {
 // them.
 //
 // The primary path for a signal. Focused child loops share working memory,
-// while keeping separate conversations. The standalone workflow executor
-// can also spawn a loop, but workflow is not part of the signal hot path.
+// while keeping separate conversations. Scheduler workflows can also spawn
+// focused loops through the workflow executor.
 
 export interface AgentLoopOpts {
   id: string;
+  // A parent/supervisor abort stops this loop and its workers.
+  signal?: AbortSignal;
+  // Includes retries and backoff; default ten minutes per generation.
+  generationTimeoutMs?: number;
+  // Maximum active tools in a round; default four. Replies keep call order.
+  maxConcurrentTools?: number;
   // Shared by every loop working on this task; never engine-global.
   sessionContext: SessionContext;
   // Pre-assembled context that goes at the top of the system prompt (e.g.
@@ -105,7 +114,8 @@ export interface AgentLoop {
   // Run the loop with whatever is currently in `messages`. Useful when
   // the caller pre-loaded history and just wants the LLM to react.
   run(): Promise<string>;
-  close(): void;
+  // Cancels an active run and waits for child loops and trace finalizers.
+  close(): Promise<void>;
 }
 
 const DEFAULT_MAX_ITERATIONS = 100;
@@ -122,9 +132,16 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
   const model = preset.model;
   const reasoningEffort = preset.reasoningEffort;
   const maxIterations = opts.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+  const maxConcurrentTools = opts.maxConcurrentTools ?? 4;
+  if (!Number.isInteger(maxConcurrentTools) || maxConcurrentTools < 1) {
+    throw new Error("maxConcurrentTools must be a positive integer");
+  }
   const allowedTools: ReadonlySet<string> | null = opts.allowedTools ?? null;
   let subAgentCounter = 0;
   let closed = false;
+  let running: Promise<string> | undefined;
+  const cancellation = new AbortController();
+  const signal = opts.signal ? AbortSignal.any([opts.signal, cancellation.signal]) : cancellation.signal;
 
   // Compose the actual system message sent to the LLM: caller's prompt
   // first, then each resolved skill body, joined with `---`. Skills
@@ -223,6 +240,13 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     allocSubAgentId: () => `${id}__sub${++subAgentCounter}`,
   };
 
+  let traceEnded = false;
+  function endTrace(): void {
+    if (traceEnded) return;
+    traceEnded = true;
+    trace?.end();
+  }
+
   function endToolSpan(span: Span, result: string): void {
     span.end({
       output: result,
@@ -230,36 +254,55 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     });
   }
 
-  async function invokeTool(name: string, args: Record<string, unknown>, span: TraceContext): Promise<string> {
+  async function invokeTool(name: string, args: Record<string, unknown>, span: TraceContext, signal: AbortSignal): Promise<string> {
     try {
+      signal.throwIfAborted();
       const synthetic = SYNTHETIC_TOOLS_BY_NAME.get(name);
       if (synthetic) {
         if (!(synthetic.visibleTo?.(toolCtx) ?? true)) return `[tool error] ${name} is unavailable in this loop`;
-        return await synthetic.run(toolCtx, args, span);
+        return await synthetic.run({ ...toolCtx, signal }, args, span);
       }
       if (!engine.mcp.tools.some((tool) => tool.function.name === name) || (allowedTools !== null && !allowedTools.has(name))) {
         return `[tool error] ${name} is unavailable in this loop`;
       }
-      return await engine.mcp.callTool(name, args);
+      return await engine.mcp.callTool(name, args, { signal });
     } catch (err) {
+      signal.throwIfAborted();
       // A failed action is an observation the agent can reason about. Never
       // retry side effects automatically; let it inspect the failure first.
       return `[tool error] ${name}: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 
-  async function runUntilSettled(): Promise<string> {
-    const { mcp } = engine;
-    // Resolve provider once per run. Model is fixed for the loop's
-    // lifetime, so the provider does not change across iterations either.
-    const provider = engine.resolveProvider(model);
+  function invokeToolEffect(name: string, args: Record<string, unknown>, span: TraceContext): Effect.Effect<string, Error> {
+    return Effect.suspend(() => {
+      let pending: Promise<string> | undefined;
+      return Effect.tryPromise({
+        try: (signal) => (pending = invokeTool(name, args, span, signal)),
+        catch: toError,
+      }).pipe(
+        // Child loops cross the Promise interface. Their inherited signal stops
+        // them; await their finally blocks before ending the parent's tool span.
+        Effect.onExit(() => {
+          const completion = pending;
+          return name === INVOKE_SUB_AGENT_TOOL_NAME && completion
+            ? Effect.promise(() => completion.then(() => undefined, () => undefined))
+            : Effect.void;
+        }),
+      );
+    });
+  }
 
-    // Scoped workers expose their resolved input as well, so the trace and
-    // per-node judge can see what data was actually supplied by input_refs.
-    const firstUserMessage = messages.find((m) => m.role === "user");
-    if (firstUserMessage) scope.update({ input: firstUserMessage.content });
+  function runUntilSettled(): Effect.Effect<string, Error> {
+    return Effect.gen(function* () {
+      const { mcp } = engine;
+      // The model is fixed for the loop's lifetime.
+      const provider = engine.resolveProvider(model);
 
-    try {
+      // Record resolved worker input for tracing and the per-node judge.
+      const firstUserMessage = messages.find((m) => m.role === "user");
+      if (firstUserMessage) scope.update({ input: firstUserMessage.content });
+
       for (let i = 0; i < maxIterations; i++) {
         // MCP tools filtered by the per-session allow-list (union of
         // loaded skills' frontmatter). Synthetic agent-side tools are
@@ -279,44 +322,23 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
         // array — that's the actual LLM input and the right place for it
         // (Langfuse UI collapses long content). metadata stays a short
         // K/V marker (agent_id) for filtering only.
-        const generation = scope.generation({
-          name: `iter-${i}`,
-          model,
-          modelParameters: {
-            reasoning_effort: reasoningEffort,
-            thinking: reasoningEffort === "disabled" ? "disabled" : "enabled",
+        const result = yield* generationEffect({
+          provider,
+          params: { model, messages, reasoningEffort, tools },
+          scope,
+          timeoutMs: opts.generationTimeoutMs,
+          observation: {
+            name: `iter-${i}`,
+            modelParameters: {
+              reasoning_effort: reasoningEffort,
+              thinking: reasoningEffort === "disabled" ? "disabled" : "enabled",
+            },
+            metadata: observationMeta,
           },
-          input: structuredClone(messages),
-          metadata: observationMeta,
         });
-
-        // The provider wrapper owns request shaping (thinking /
-        // reasoning_effort, history repair) and usage normalization —
-        // the loop stays provider-agnostic.
-        let result;
-        try {
-          result = await provider.complete({
-            model,
-            messages,
-            reasoningEffort,
-            tools,
-            // Retry attempts (withRetry decorator) land as WARNING events
-            // on this session's scope, next to the iter generations.
-            trace: scope,
-          });
-        } catch (err) {
-          generation.end({
-            output: { error: (err as Error).message },
-            level: "ERROR",
-            statusMessage: (err as Error).message,
-          });
-          throw err;
-        }
 
         const { message } = result;
         messages.push(message);
-
-        generation.end({ output: message, usage: result.usage });
 
         engine.log(id, `iter ${i} finish=${result.finishReason} tool_calls=${message.tool_calls?.length ?? 0}`);
 
@@ -325,13 +347,10 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
           return message.content ?? "";
         }
 
-        // Dispatch all tool calls in this round in parallel. The model
-        // expects parallel-tool-call semantics — if it emits 3 tool_calls,
-        // running them sequentially adds N×latency for no reason. Results
-        // are still pushed in the original tool_calls order so the
-        // message buffer is deterministic regardless of completion order.
-        const toolResults = await Promise.all(
-          message.tool_calls.map(async (call) => {
+        // Bound concurrency while keeping replies in tool-call order. Expected
+        // tool failures stay observations; interruption stops the whole round.
+        const toolResults = yield* Effect.forEach(
+          message.tool_calls, (call) => Effect.suspend(() => {
             const synthetic = SYNTHETIC_TOOLS_BY_NAME.get(call.function.name);
             // Span per tool call. We open it BEFORE parsing args so a
             // malformed-JSON case still leaves a measurable, attributed
@@ -347,29 +366,41 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
               metadata: { ...observationMeta, tool_call_id: call.id },
             });
 
-            let result: string;
-            try {
-              const args = z.record(z.unknown()).parse(JSON.parse(call.function.arguments || "{}"));
+            const invoke = Effect.gen(function* () {
+              let args: Record<string, unknown>;
+              try {
+                args = z.record(z.unknown()).parse(JSON.parse(call.function.arguments || "{}"));
+              } catch (err) {
+                return `[tool error] arguments must be a JSON object: ${toError(err).message}`;
+              }
               span.update({ input: args });
-              result = await invokeTool(call.function.name, args, span);
-            } catch (err) {
-              result = `[tool error] arguments must be a JSON object: ${err instanceof Error ? err.message : String(err)}`;
-            }
+              return yield* invokeToolEffect(call.function.name, args, span);
+            });
 
-            let presented = result;
-            if (synthetic?.resultMode !== "inline") {
-              const stored = storeToolResult(sessionContext.memory, result);
-              presented = JSON.stringify(stored);
-              span.update({ metadata: {
-                memory_key: stored.memory_key,
-                result_size_bytes: stored.size_bytes,
-                result_truncated: stored.truncated,
-              } });
-            }
-            endToolSpan(span, result);
-            engine.log(id, `← ${call.function.name}: ${presented}`);
-            return { call, result: presented };
-          }),
+            return invoke.pipe(
+              Effect.map((result) => {
+                let presented = result;
+                if (synthetic?.resultMode !== "inline") {
+                  const stored = storeToolResult(sessionContext.memory, result);
+                  presented = JSON.stringify(stored);
+                  span.update({ metadata: {
+                    memory_key: stored.memory_key,
+                    result_size_bytes: stored.size_bytes,
+                    result_truncated: stored.truncated,
+                  } });
+                }
+                engine.log(id, `← ${call.function.name}: ${presented}`);
+                return { call, result: presented, raw: result };
+              }),
+              Effect.onExit((exit) => Effect.sync(() => {
+                if (Exit.isSuccess(exit)) endToolSpan(span, exit.value.raw);
+                else {
+                  const error = toError(Cause.squash(exit.cause));
+                  span.end({ level: "ERROR", statusMessage: error.message });
+                }
+              })),
+            );
+          }), { concurrency: maxConcurrentTools },
         );
 
         for (const { call, result } of toolResults) {
@@ -381,24 +412,30 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
         }
       }
 
-      throw new Error(`session ${id} exceeded maxIterations=${maxIterations}`);
-    } catch (err) {
-      // Trace-level error marker. Individual generation/span errors are
-      // already attributed above; this surfaces failed sessions in the
-      // tracing list view. The owner closes a supplied scope with ERROR
-      // when the exception propagates back to the parent or supervisor.
-      scope.update({
-        output: { error: err instanceof Error ? err.message : String(err) },
-        metadata: { error: true },
-      });
-      throw err;
-    } finally {
+      return yield* Effect.fail(new Error(`session ${id} exceeded maxIterations=${maxIterations}`));
+    }).pipe(Effect.onExit((exit) => Effect.sync(() => {
+      if (Exit.isFailure(exit)) {
+        scope.update({
+          output: { error: toError(Cause.squash(exit.cause)).message },
+          metadata: { error: true },
+        });
+      }
       // Close the root trace span for top-level sessions. v5/OTel keeps
       // a trace "open" until its root span is explicitly ended, even after
       // all child observations have closed. Sub-agents skip this — the
       // parent's dispatch loop ends the wrapping span.
-      trace?.end();
-    }
+      endTrace();
+    })));
+  }
+
+  function run(): Promise<string> {
+    if (closed || signal.aborted) return Promise.reject(new DOMException(`session ${id} is closed`, "AbortError"));
+    if (running) return Promise.reject(new Error(`session ${id} is already running`));
+    running = Effect.runPromise(runUntilSettled(), { signal }).catch((error: unknown) => {
+      if (signal.aborted) throw new DOMException(`session ${id} was cancelled`, "AbortError");
+      throw error;
+    }).finally(() => { running = undefined; });
+    return running;
   }
 
   return {
@@ -411,15 +448,17 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     model,
     reasoningEffort,
     async send(userText) {
+      if (closed || signal.aborted) throw new DOMException(`session ${id} is closed`, "AbortError");
+      if (running) throw new Error(`session ${id} is already running`);
       messages.push({ role: "user", content: userText });
-      return this.run();
+      return run();
     },
-    async run() {
-      if (closed) throw new Error(`session ${id} is closed`);
-      return runUntilSettled();
-    },
-    close() {
+    run,
+    async close() {
       closed = true;
+      cancellation.abort();
+      await running?.catch(() => undefined);
+      endTrace();
     },
   };
 }

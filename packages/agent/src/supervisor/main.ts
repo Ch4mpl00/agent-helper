@@ -184,7 +184,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     console.log(`[supervisor] ${sig} — shutting down`);
-    await engine.shutdown();
+    await supervisor.shutdown();
     db.$client.close();
     process.exit(0);
   };
@@ -207,6 +207,7 @@ async function main(): Promise<void> {
       );
       await supervisor.runSignal(result.signal);
     } catch (err) {
+      if (stopping) break;
       console.error("[supervisor] loop error:", err);
       await sleep(POLL_INTERVAL_MS);
     }

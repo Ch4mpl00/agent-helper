@@ -1,9 +1,27 @@
 # Dedupe the "one traced LLM generation" envelope
 
-**Status:** pending
+**Status:** done
 **Priority:** P2
 **Area:** agent / providers + tracing
 **Created:** 2026-06-07
+
+## Completed 2026-09-10
+
+- Installed and pinned `effect@4.0.0-rc.113` in the agent package.
+- `generation.ts` shares the generation lifecycle across AgentLoop, composer,
+  and compiler. The compiler validates before closing its generation so only
+  accepted plans carry the planner judge tag.
+- Each generation has a ten-minute deadline including retry/backoff. Provider
+  retries use Effect schedules; SDK retries are disabled at the request boundary.
+- AgentLoop uses bounded Effect concurrency (four tools by default), propagates
+  cancellation to requests and workers, and awaits finalizers on close.
+- Supervisor shutdown cancels active signals and closes their traces before
+  flushing the engine. Workflow parallel failures interrupt sibling branches;
+  late responses cannot create variable bindings after cancellation.
+- Validation: `pnpm typecheck`; all 475 tests passed, including local HTTP tests
+  run with permission to bind test ports. Retry timing uses Effect's TestClock.
+
+The original design context and acceptance criteria follow below.
 
 ## Context
 

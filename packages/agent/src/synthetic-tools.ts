@@ -32,6 +32,7 @@ import { renderContext, type SessionContext } from "./session-context";
 // dispatch time; every field is something at least one tool genuinely uses.
 export interface SyntheticToolContext {
   loopId: string;
+  signal?: AbortSignal;
   // Undefined for top-level loops; set for sub-agents. `invoke_sub_agent`
   // uses it to stay parent-only (no recursive delegation).
   parentId?: string;
@@ -49,7 +50,7 @@ export interface SyntheticToolContext {
     messages: ChatCompletionMessageParam[];
     run(): Promise<string>;
   }>;
-  endAgentLoop(id: string): void;
+  endAgentLoop(id: string): void | Promise<void>;
   // Allocates the next `<loopId>__subN` child id (parent owns the counter).
   allocSubAgentId(): string;
 }
@@ -437,7 +438,7 @@ export const SYNTHETIC_TOOLS: SyntheticTool[] = [
     schema: CodeAgentArgsSchema,
     handle: async (ctx, args) => {
       try {
-        const out = await runCodeAgent(ctx.codex, args);
+        const out = await runCodeAgent(ctx.codex, args, ctx.signal);
         ctx.log(`code_agent ${args.task.slice(0, 80)} → ${out.slice(0, 80)}`);
         return out;
       } catch (err) {
@@ -516,6 +517,7 @@ export const SYNTHETIC_TOOLS: SyntheticTool[] = [
       try {
         child = await ctx.startAgentLoop({
           id: childId,
+          signal: ctx.signal,
           sessionContext: ctx.sessionContext,
           // Sub-agent's system message = optional parent-provided framing
           // + named skills, the small environment block and memory instructions.
@@ -549,7 +551,7 @@ export const SYNTHETIC_TOOLS: SyntheticTool[] = [
       } catch (err) {
         return `[invoke_sub_agent error] sub-agent crashed: ${(err as Error).message}`;
       } finally {
-        ctx.endAgentLoop(childId);
+        await ctx.endAgentLoop(childId);
       }
     },
   }),

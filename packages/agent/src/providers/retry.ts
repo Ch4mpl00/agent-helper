@@ -1,12 +1,14 @@
 import OpenAI from "openai";
+import { Duration, Effect, Schedule } from "effect";
+import { toError } from "../errors";
 import type { ChatProvider, CompletionParams, CompletionResult } from "./types";
 
 // Transient-failure retry, factored OUT of individual providers. Retrying is
 // a cross-cutting reliability policy, not a property of one endpoint: the
 // workflow compiler is on the hot path no matter which provider its model
 // routes to (AGENT_COMPILER_MODEL switches the route silently), so the
-// engine wraps EVERY provider with `withRetry` at startup. 429 (rate limit)
-// and 5xx (overload / transient server error) back off and retry; any other
+// engine wraps EVERY provider with `withRetry` at startup. 408/429 and
+// 5xx (overload / transient server error) back off and retry; any other
 // 4xx is permanent and rethrows immediately.
 //
 // Visibility contract: a retry must never look like one slow call. When the
@@ -24,46 +26,58 @@ export interface RetryInfo {
 }
 
 export interface RetryOpts {
-  // Retries after the initial attempt. Default 4 → 2s,4s,8s,16s backoff.
+  // Retries after the initial attempt. Default 4, with exponential backoff.
   maxRetries?: number;
   baseDelayMs?: number;
+  maxDelayMs?: number;
+  jitter?: boolean;
 }
 
-// Low-level helper for callers that work with a raw OpenAI client instead
-// of a ChatProvider (e.g. the judge-replay script).
-export async function retryOnTransient<T>(
-  fn: () => Promise<T>,
+function isTransient(error: Error): boolean {
+  return error instanceof OpenAI.APIConnectionError ||
+    (error instanceof OpenAI.APIError && error.status !== undefined &&
+      (error.status === 408 || error.status === 429 || error.status >= 500));
+}
+
+// Effect owns the retry clock and cancellation, including the backoff sleep.
+// Concrete providers disable SDK retries so every attempt is visible here.
+export function retryOnTransientEffect<T>(
+  fn: (signal: AbortSignal) => Promise<T>,
   opts: RetryOpts & { onRetry?: (info: RetryInfo) => void } = {},
+): Effect.Effect<T, Error> {
+  const exponential = Schedule.exponential(opts.baseDelayMs ?? 2000);
+  const schedule = (opts.jitter === false ? exponential : Schedule.jittered(exponential)).pipe(
+    Schedule.modifyDelay(({ duration }) => Effect.succeed(Math.min(Duration.toMillis(duration), opts.maxDelayMs ?? 30_000))),
+    Schedule.tap(({ attempt, input, duration }) => Effect.sync(() => {
+      // Schedule decisions are evaluated before retry's times/while guards.
+      if (!(input instanceof Error) || !isTransient(input) || attempt > (opts.maxRetries ?? 4)) return;
+      opts.onRetry?.({
+        attempt,
+        status: input instanceof OpenAI.APIError ? input.status : undefined,
+        delayMs: Duration.toMillis(duration),
+      });
+    })),
+  );
+  return Effect.tryPromise({ try: fn, catch: toError }).pipe(
+    Effect.retry({ schedule, times: opts.maxRetries ?? 4, while: isTransient }),
+  );
+}
+
+// Promise boundary for scripts and the existing ChatProvider interface.
+export function retryOnTransient<T>(
+  fn: (signal: AbortSignal) => Promise<T>,
+  opts: RetryOpts & { signal?: AbortSignal; onRetry?: (info: RetryInfo) => void } = {},
 ): Promise<T> {
-  const maxRetries = opts.maxRetries ?? 4;
-  const baseDelayMs = opts.baseDelayMs ?? 2000;
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const status = err instanceof OpenAI.APIError ? err.status : undefined;
-      // 429 + 5xx back off and retry. A connection-level failure (no HTTP
-      // status — ECONNRESET, timeout, "Premature close" mid-stream on a large
-      // completion) is equally transient, so retry it too; any other 4xx is
-      // permanent and rethrows.
-      const retryable =
-        status === 429 ||
-        (status !== undefined && status >= 500) ||
-        err instanceof OpenAI.APIConnectionError;
-      if (!retryable || attempt >= maxRetries) throw err;
-      const delayMs = baseDelayMs * 2 ** attempt;
-      opts.onRetry?.({ attempt: attempt + 1, status, delayMs });
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-  }
+  return Effect.runPromise(retryOnTransientEffect(fn, opts), { signal: opts.signal });
 }
 
 export function withRetry(provider: ChatProvider, opts: RetryOpts = {}): ChatProvider {
   return {
     kind: provider.kind,
     complete(params: CompletionParams): Promise<CompletionResult> {
-      return retryOnTransient(() => provider.complete(params), {
+      return retryOnTransient((signal) => provider.complete({ ...params, signal }), {
         ...opts,
+        signal: params.signal,
         onRetry: ({ attempt, status, delayMs }) => {
           console.warn(
             `[retry] ${provider.kind}/${params.model} attempt ${attempt} failed` +

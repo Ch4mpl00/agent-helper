@@ -1,6 +1,7 @@
 import type { ChatCompletionMessage, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import { describe, expect, it, vi } from "vitest";
 import { createEngine } from "./engine";
+import type { AgentLoopOpts } from "./agent-loop";
 import { DEFAULT_PRESETS } from "./models";
 import type { CompletionParams, ChatProvider } from "./providers";
 import { createSessionContext } from "./session-context";
@@ -9,7 +10,7 @@ import { createLocalRecorderTracer } from "./tracing/local-recorder";
 import { teeTracer } from "./tracing/tee";
 import type { StoredTraceInput, TraceStore } from "./db/trace-store";
 import { createSupervisorModule } from "./supervisor/module";
-import type { WorkflowRunner, WorkflowRunResult } from "./workflow";
+import { createWorkflowRunner, type WorkflowRunner, type WorkflowRunResult } from "./workflow";
 import type { Step } from "./workflow/dsl";
 import { createStore } from "./workflow/variables";
 import { createSkillStore } from "./skills";
@@ -61,7 +62,7 @@ function context(id = "task") {
   });
 }
 
-type Turn = (params: CompletionParams) => ChatCompletionMessage;
+type Turn = (params: CompletionParams) => ChatCompletionMessage | Promise<ChatCompletionMessage>;
 
 function harness(turns: Turn[], toolResult = "found", tracer: Tracer = nullTracer) {
   const requests: ChatCompletionMessageParam[][] = [];
@@ -71,10 +72,10 @@ function harness(turns: Turn[], toolResult = "found", tracer: Tracer = nullTrace
       requests.push(structuredClone(params.messages));
       const turn = turns.shift();
       if (!turn) throw new Error("Unexpected LLM call");
-      return { message: turn(params), finishReason: "stop", usage: { input: 10, output: 5, total: 15, cached: 2 } };
+      return { message: await turn(params), finishReason: "stop", usage: { input: 10, output: 5, total: 15, cached: 2 } };
     },
   };
-  const callTool = vi.fn(async () => toolResult);
+  const callTool = vi.fn(async (_name: string, _args: Record<string, unknown>, _options?: { signal?: AbortSignal }) => toolResult);
   const persist = vi.fn();
   const engine = createEngine({
     providers: { openai: provider, gemini: provider, deepseek: provider },
@@ -98,7 +99,7 @@ function harness(turns: Turn[], toolResult = "found", tracer: Tracer = nullTrace
   const sessionContext = context();
   return {
     engine, sessionContext, callTool, persist, requests,
-    start: () => engine.startAgentLoop({ id: "parent", sessionContext, skills: ["test"] }),
+    start: (opts: Partial<AgentLoopOpts> = {}) => engine.startAgentLoop({ id: "parent", sessionContext, skills: ["test"], ...opts }),
   };
 }
 
@@ -124,7 +125,7 @@ describe("AgentLoop working memory", () => {
       },
     ]);
     expect(await (await h.start()).send("search")).toBe("done");
-    expect(h.callTool).toHaveBeenCalledWith("search_news", { query: "today" });
+    expect(h.callTool).toHaveBeenCalledWith("search_news", { query: "today" }, { signal: expect.any(AbortSignal) });
     expect(h.sessionContext.memory.list()).toHaveLength(2);
   });
 
@@ -359,6 +360,142 @@ function recording() {
   return { tracer: createLocalRecorderTracer(store), written };
 }
 
+function deferred<T>() {
+  let resolve: (value: T) => void = () => { throw new Error("Deferred is not initialized"); };
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe("AgentLoop Effect lifecycle", () => {
+  it("aborts a pending generation and ignores its late tool calls after close", async () => {
+    const started = deferred<AbortSignal>();
+    const pending = deferred<ChatCompletionMessage>();
+    const { tracer, written } = recording();
+    const h = harness([({ signal }) => {
+      if (!signal) throw new Error("Missing cancellation signal");
+      started.resolve(signal);
+      return pending.promise; // deliberately ignores abort, like an uncooperative SDK
+    }], "unused", tracer);
+    const loop = await h.start();
+    const sent = loop.send("work");
+    const rejected = expect(sent).rejects.toMatchObject({ name: "AbortError" });
+    const signal = await started.promise;
+    await expect(loop.send("overlap")).rejects.toThrow("already running");
+    expect(loop.messages.filter((m) => m.role === "user")).toHaveLength(1);
+    await loop.close();
+    await rejected;
+    expect(signal.aborted).toBe(true);
+    pending.resolve(call("search_news", { query: "late" }));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.callTool).not.toHaveBeenCalled();
+    expect(h.requests).toHaveLength(1);
+    expect(h.sessionContext.memory.list()).toEqual([]);
+    await loop.close();
+    expect(written).toHaveLength(1);
+    expect(written[0]?.observations.find((o) => o.type === "GENERATION")?.level).toBe("ERROR");
+    await expect(loop.send("closed")).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("cancels a child loop and closes its observations before the parent trace", async () => {
+    const started = deferred<AbortSignal>();
+    const { tracer, written } = recording();
+    const h = harness([
+      () => call("invoke_sub_agent", { prompt: "work" }),
+      ({ signal }) => {
+        if (!signal) throw new Error("Missing worker signal");
+        started.resolve(signal);
+        return new Promise<ChatCompletionMessage>(() => {});
+      },
+    ], "unused", tracer);
+    const ends = vi.spyOn(h.engine, "endAgentLoop");
+    const loop = await h.start();
+    const rejected = expect(loop.send("delegate")).rejects.toMatchObject({ name: "AbortError" });
+    const childSignal = await started.promise;
+    await loop.close();
+    await rejected;
+    expect(childSignal.aborted).toBe(true);
+    expect(ends).toHaveBeenCalledWith("parent__sub1");
+    expect(h.requests).toHaveLength(2);
+    expect(written).toHaveLength(1);
+    expect(written[0]?.observations.find((o) => o.name === "invoke_sub_agent")?.level).toBe("ERROR");
+    expect(h.sessionContext.memory.list()).toEqual([]);
+  });
+
+  it("aborts the active MCP call and never starts queued tools", async () => {
+    const started = deferred<AbortSignal>();
+    const calls = [call("search_news", {}, "a"), call("search_news", {}, "b")];
+    const h = harness([() => ({ ...calls[0]!, tool_calls: calls.flatMap((c) => c.tool_calls ?? []) })]);
+    h.callTool.mockImplementation((_name, _args, options) => {
+      const signal = options?.signal;
+      if (!signal) throw new Error("Missing MCP signal");
+      started.resolve(signal);
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+    const loop = await h.start({ maxConcurrentTools: 1 });
+    const rejected = expect(loop.send("tools")).rejects.toMatchObject({ name: "AbortError" });
+    const signal = await started.promise;
+    await loop.close();
+    await rejected;
+    expect(signal.aborted).toBe(true);
+    expect(h.callTool).toHaveBeenCalledTimes(1);
+    expect(h.sessionContext.memory.list()).toEqual([]);
+  });
+
+  it("bounds tool concurrency and preserves reply order when completions arrive out of order", async () => {
+    const pending = [deferred<string>(), deferred<string>(), deferred<string>()];
+    const secondStarted = deferred<void>();
+    const thirdStarted = deferred<void>();
+    const calls = pending.map((_, i) => call("search_news", { query: String(i) }, String(i)));
+    const h = harness([
+      () => ({ ...calls[0]!, tool_calls: calls.flatMap((c) => c.tool_calls ?? []) }),
+      ({ messages }) => {
+        const replies = messages.filter((m) => m.role === "tool").map((m) => JSON.parse(String(m.content)).content);
+        expect(replies).toEqual(["first", "second", "third"]);
+        return answer("done");
+      },
+    ]);
+    let active = 0;
+    let peak = 0;
+    h.callTool.mockImplementation(async (_name, args) => {
+      const i = Number(args.query);
+      active++;
+      peak = Math.max(peak, active);
+      if (i === 1) secondStarted.resolve();
+      if (i === 2) thirdStarted.resolve();
+      try { return await pending[i]!.promise; }
+      finally { active--; }
+    });
+    const loop = await h.start({ maxConcurrentTools: 2 });
+    const sent = loop.send("parallel");
+    await secondStarted.promise;
+    expect(h.callTool).toHaveBeenCalledTimes(2);
+    pending[1]!.resolve("second");
+    await thirdStarted.promise;
+    pending[2]!.resolve("third");
+    pending[0]!.resolve("first");
+    expect(await sent).toBe("done");
+    expect(peak).toBe(2);
+  });
+
+  it("times out a generation, aborts its request and records the failure", async () => {
+    const started = deferred<AbortSignal>();
+    const { tracer, written } = recording();
+    const h = harness([({ signal }) => {
+      if (!signal) throw new Error("Missing signal");
+      started.resolve(signal);
+      return new Promise<ChatCompletionMessage>(() => {});
+    }], "unused", tracer);
+    const loop = await h.start({ generationTimeoutMs: 10 });
+    await expect(loop.send("timeout")).rejects.toThrow("Generation timed out after 10ms");
+    expect((await started.promise).aborted).toBe(true);
+    expect(written[0]?.observations.find((o) => o.type === "GENERATION")).toMatchObject({
+      level: "ERROR", statusMessage: "Generation timed out after 10ms",
+    });
+  });
+});
+
 describe("primary AgentLoop and tracing", () => {
   const signal = { id: 1, source: "telegram", content: "chatId=42: summarize", envContext: "chatId=42", created_at: "2026-09-06T12:00:00Z" };
 
@@ -376,6 +513,32 @@ describe("primary AgentLoop and tracing", () => {
     });
   }
 
+  it.each(["telegram", "scheduler"])("waits for %s cancellation and trace cleanup on shutdown without starting recovery", async (source) => {
+    const started = deferred<void>();
+    const local = recording();
+    const shutdown = vi.fn(async () => { expect(local.written).toHaveLength(1); });
+    const h = harness([() => {
+      started.resolve();
+      return new Promise<ChatCompletionMessage>(() => {});
+    }], "unused", { ...local.tracer, shutdown });
+    const starts = vi.spyOn(h.engine, "startAgentLoop");
+    const mcpClose = vi.spyOn(h.engine.mcp, "close");
+    const workflow = createWorkflowRunner({
+      engine: h.engine, mcpTools: [searchTool], knownSkills: ["test"],
+      readSkill: async () => "test skill", setMemory: () => {},
+    });
+    const runner = supervisor(h, workflow);
+    const rejected = expect(runner.runSignal({ ...signal, source })).rejects.toMatchObject({ name: "AbortError" });
+    await started.promise;
+    await runner.shutdown();
+    await rejected;
+    await runner.shutdown();
+    expect(starts).toHaveBeenCalledTimes(source === "telegram" ? 1 : 0);
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(mcpClose).toHaveBeenCalledTimes(1);
+    await expect(h.start()).rejects.toMatchObject({ name: "AbortError" });
+  });
+
   it("loads Telegram history before the first generation and shares its reference with workers", async () => {
     const { tracer, written } = recording();
     const history = { messages: [
@@ -383,7 +546,7 @@ describe("primary AgentLoop and tracing", () => {
     ] };
     const h = harness([
       ({ messages }) => {
-        expect(h.callTool).toHaveBeenCalledExactlyOnceWith("get_telegram_chat_history", { chatId: "42", limit: 20 });
+        expect(h.callTool).toHaveBeenCalledExactlyOnceWith("get_telegram_chat_history", { chatId: "42", limit: 20 }, { signal: expect.any(AbortSignal) });
         expect(JSON.stringify(messages)).toContain("Собрать сводку за неделю?");
         return call("invoke_sub_agent", { prompt: "summarize", input_refs: ["telegram.history"] });
       },

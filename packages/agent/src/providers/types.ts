@@ -28,6 +28,7 @@ import type { TokenUsage, TraceContext } from "../tracing";
 export type ProviderKind = "deepseek" | "openai" | "gemini";
 
 export interface CompletionParams {
+  signal?: AbortSignal;
   model: string;
   messages: ChatCompletionMessageParam[];
   // Provider decides how to express it (DeepSeek: thinking + reasoning_effort;

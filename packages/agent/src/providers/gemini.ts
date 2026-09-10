@@ -38,7 +38,7 @@ export function createGeminiProvider(client: OpenAI): ChatProvider {
       } else if (params.reasoningEffort !== "disabled") {
         Object.assign(body, { reasoning_effort: "high" });
       }
-      const raw = await client.chat.completions.create(body);
+      const raw = await client.chat.completions.create(body, { signal: params.signal, maxRetries: 0 });
       return toResult(raw, normalizeOpenAiUsage(raw.usage));
     },
   };

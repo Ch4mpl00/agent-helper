@@ -1,6 +1,9 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
+import { runGeneration } from "../generation";
+import { Cause, Effect, Exit } from "effect";
+import { toError } from "../errors";
 import type { AgentLoopOpts } from "../agent-loop";
 import type { SessionContext } from "../session-context";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
@@ -74,6 +77,7 @@ export type ExecResult =
     };
 
 export interface ExecContext {
+  abortSignal?: AbortSignal;
   sessionContext: SessionContext;
   store: VariableStore;
   // Caller-provided trace scope. Executor opens its own root span inside
@@ -97,10 +101,10 @@ export interface EngineSurface {
   readonly presets: Record<PresetName, ModelPreset>;
   resolveProvider(model: string): ChatProvider;
   mcp: {
-    callTool(name: string, args: Record<string, unknown>): Promise<string>;
+    callTool(name: string, args: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<string>;
   };
   startAgentLoop(opts: AgentLoopOpts): Promise<AgentLoopHandle>;
-  endAgentLoop(id: string): void;
+  endAgentLoop(id: string): void | Promise<void>;
 }
 
 // Surface of AgentLoop that the executor touches when running an
@@ -146,6 +150,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 
       try {
         for (let i = 0; i < workflow.steps.length; i++) {
+          ctx.abortSignal?.throwIfAborted();
           const step = workflow.steps[i]!;
           const outcome = await runOneStep(step, i, ctx.store, rootSpan, ctx, deps);
           if (!outcome.ok) {
@@ -317,15 +322,16 @@ async function dispatch(
   ctx: ExecContext,
   deps: ExecutorDeps,
 ): Promise<DispatchResult> {
+  ctx.abortSignal?.throwIfAborted();
   switch (step.kind) {
     case "tool":
-      return { stop: false, output: await execTool(step, store, span, deps) };
+      return { stop: false, output: await execTool(step, store, span, deps, ctx.abortSignal) };
     case "llm_compose":
-      return { stop: false, output: await execLlmCompose(step, store, span, deps) };
+      return { stop: false, output: await execLlmCompose(step, store, span, deps, ctx.abortSignal) };
     case "llm_agent":
       return { stop: false, output: await execLlmAgent(step, store, span, ctx, deps) };
     case "code_agent":
-      return { stop: false, output: await execCodeAgent(step, store, span, deps) };
+      return { stop: false, output: await execCodeAgent(step, store, span, deps, ctx.abortSignal) };
     case "parallel":
       await execParallel(step, store, span, ctx, deps);
       return { stop: false };
@@ -380,6 +386,7 @@ async function execTool(
   store: VariableStore,
   span: Span,
   deps: ExecutorDeps,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const resolvedArgs = substitute(step.args, store) as Record<string, unknown>;
   span.update({ input: { tool: step.tool, args: resolvedArgs } });
@@ -397,10 +404,12 @@ async function execTool(
 
   let raw: string;
   try {
-    raw = await deps.engine.mcp.callTool(step.tool, resolvedArgs);
+    raw = await deps.engine.mcp.callTool(step.tool, resolvedArgs, { signal });
   } catch (err) {
-    throw new ToolCallError(step.tool, (err as Error).message);
+    signal?.throwIfAborted();
+    throw new ToolCallError(step.tool, toError(err).message);
   }
+  signal?.throwIfAborted();
 
   // MCP error responses come back as text starting with `[tool error]`.
   // Surface those as ToolCallError so the executor classifies correctly.
@@ -460,13 +469,15 @@ async function execCodeAgent(
   store: VariableStore,
   span: Span,
   deps: ExecutorDeps,
+  signal?: AbortSignal,
 ): Promise<string> {
   if (!deps.codex) throw new Error("code_agent: codex backend not configured");
   const task = substituteText(step.task, store);
   const data = step.data !== undefined ? substituteText(step.data, store) : undefined;
   span.update({ input: { task, has_data: data !== undefined } });
 
-  const result = await runCodeAgent(deps.codex, { task, data });
+  const result = await runCodeAgent(deps.codex, { task, data }, signal);
+  signal?.throwIfAborted();
   store.set(step.bind, result);
   return result;
 }
@@ -492,6 +503,7 @@ async function execLlmCompose(
   store: VariableStore,
   span: Span,
   deps: ExecutorDeps,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const preset = deps.engine.presets[step.preset];
   const provider = deps.engine.resolveProvider(preset.model);
@@ -534,37 +546,23 @@ async function execLlmCompose(
   if (system) messages.push({ role: "system", content: system });
   messages.push({ role: "user", content: userText });
 
-  const gen = span.generation({
-    name: `llm_compose:${step.bind}`,
-    model: preset.model,
-    modelParameters: {
-      reasoning_effort: preset.reasoningEffort,
-      tools_mode: "none",
-    },
-    input: messages,
-    // Mark this as a compose node for the per-node judge, self-contained: the
-    // owner skill rides along (null = prompt-only → the planner owns it). The
-    // judge classifies by this tag, never the `llm_compose:*` name.
-    metadata: { [JUDGE_NODE_META]: "compose", skill: step.skill ?? null },
-  });
-
   let content: string;
   try {
-    // No tools passed → the provider omits the field (the SDK rejects an
-    // empty array); a compose step is one shot, no tool_calls possible.
-    const result = await provider.complete({
-      model: preset.model,
-      messages,
-      reasoningEffort: preset.reasoningEffort,
-      // Retry attempts (withRetry decorator) land as WARNING events on
-      // this step's span, next to the llm_compose generation.
-      trace: span,
+    const result = await runGeneration({
+      provider,
+      params: { model: preset.model, messages, reasoningEffort: preset.reasoningEffort, signal },
+      scope: span,
+      observation: {
+        name: `llm_compose:${step.bind}`,
+        modelParameters: { reasoning_effort: preset.reasoningEffort, tools_mode: "none" },
+        metadata: { [JUDGE_NODE_META]: "compose", skill: step.skill ?? null },
+      },
+      describe: (result) => ({ output: result.message.content ?? "", usage: result.usage }),
     });
     content = result.message.content ?? "";
-    gen.end({ output: content, usage: result.usage });
   } catch (err) {
+    signal?.throwIfAborted();
     const message = err instanceof Error ? err.message : String(err);
-    gen.end({ output: { error: message }, level: "ERROR", statusMessage: message });
     throw new LlmCallError(message);
   }
 
@@ -574,6 +572,7 @@ async function execLlmCompose(
   // `{`/`[`, so they stay strings — same lenient rule as execTool's tool
   // results. Without this, a compose that returns JSON binds a raw string and
   // any `${bind.field}` reference fails with MissingBindingError.
+  signal?.throwIfAborted();
   const parsed = tryParseJson(content);
   store.set(step.bind, parsed);
   return parsed;
@@ -625,6 +624,7 @@ async function execLlmAgent(
 
   const child = await deps.engine.startAgentLoop({
     id: childId,
+    signal: ctx.abortSignal,
     sessionContext: ctx.sessionContext,
     skills: [step.skill],
     includeEngineSkills: false,
@@ -643,9 +643,10 @@ async function execLlmAgent(
   try {
     result = await child.run();
   } finally {
-    deps.engine.endAgentLoop(childId);
+    await deps.engine.endAgentLoop(childId);
   }
 
+  ctx.abortSignal?.throwIfAborted();
   store.set(step.bind, result);
   return result;
 }
@@ -659,23 +660,27 @@ async function execParallel(
   ctx: ExecContext,
   deps: ExecutorDeps,
 ): Promise<void> {
-  await Promise.all(
-    step.steps.map(async (child, i) => {
+  await Effect.runPromise(Effect.forEach(
+    step.steps, (child, i) => Effect.suspend(() => {
       const childSpan = span.span({
         name: `parallel[${i}]:${child.kind}`,
         kind: stepSpanKind(child.kind),
         metadata: stepMetadata(child),
       });
-      try {
-        const res = await dispatch(child, store, childSpan, ctx, deps);
-        childSpan.end({ output: spanOutput(res) });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        childSpan.end({ level: "ERROR", statusMessage: message });
-        throw err;
-      }
-    }),
-  );
+      let pending: Promise<DispatchResult> | undefined;
+      return Effect.tryPromise({
+        try: (signal) => (pending = dispatch(child, store, childSpan, { ...ctx, abortSignal: signal }, deps)),
+        catch: toError,
+      }).pipe(Effect.onExit((exit) => Effect.gen(function* () {
+        const completion = pending;
+        if (child.kind === "llm_agent" && completion) {
+          yield* Effect.promise(() => completion.then(() => undefined, () => undefined));
+        }
+        if (Exit.isSuccess(exit)) childSpan.end({ output: spanOutput(exit.value) });
+        else childSpan.end({ level: "ERROR", statusMessage: toError(Cause.squash(exit.cause)).message });
+      })));
+    }), { concurrency: 4 },
+  ), { signal: ctx.abortSignal });
 }
 
 // ─── shared helpers exported for the executor's own tests ────────────

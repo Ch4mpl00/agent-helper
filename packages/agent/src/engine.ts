@@ -48,7 +48,7 @@ export interface Engine {
   // its endpoint.
   resolveProvider(model: string): ChatProvider;
   startAgentLoop(opts: AgentLoopOpts): Promise<AgentLoop>;
-  endAgentLoop(id: string): void;
+  endAgentLoop(id: string): Promise<void>;
   log(sessionId: string, ...parts: unknown[]): void;
   // Ends open loops, flushes the tracer, closes the MCP connection.
   shutdown(): Promise<void>;
@@ -82,6 +82,8 @@ export function createEngine(deps: EngineDeps): Engine {
   const { providers, mcp, presets, skillStore, memory, tracer, codex } = deps;
   const engineSkills: readonly string[] = deps.skills ?? [];
   const agentLoops = new Map<string, AgentLoop>();
+  let stopping = false;
+  let shutdown: Promise<void> | undefined;
 
   function log(sessionId: string, ...parts: unknown[]): void {
     console.log(`[${new Date().toISOString()}]`, `[${sessionId}]`, ...parts);
@@ -104,6 +106,8 @@ export function createEngine(deps: EngineDeps): Engine {
     },
 
     async startAgentLoop(opts) {
+      if (stopping) throw new DOMException("engine is shutting down", "AbortError");
+      opts.signal?.throwIfAborted();
       if (agentLoops.has(opts.id)) {
         throw new Error(`agent-loop id ${opts.id} already exists`);
       }
@@ -172,6 +176,10 @@ export function createEngine(deps: EngineDeps): Engine {
         }
       }
 
+      // Skill reads may have overlapped shutdown or another start with this id.
+      if (stopping) throw new DOMException("engine is shutting down", "AbortError");
+      opts.signal?.throwIfAborted();
+      if (agentLoops.has(opts.id)) throw new Error(`agent-loop id ${opts.id} already exists`);
       const loop = createAgentLoop(engine, { ...opts, resolvedSkills, allowedTools });
       agentLoops.set(opts.id, loop);
       const skillsList = Object.keys(resolvedSkills).join(",");
@@ -183,20 +191,26 @@ export function createEngine(deps: EngineDeps): Engine {
       return loop;
     },
 
-    endAgentLoop(id) {
+    async endAgentLoop(id) {
       const loop = agentLoops.get(id);
       if (!loop) return;
-      loop.close();
+      await loop.close();
+      if (agentLoops.get(id) !== loop) return;
       agentLoops.delete(id);
       log(id, "agent-loop closed");
     },
 
-    async shutdown() {
-      for (const id of [...agentLoops.keys()]) engine.endAgentLoop(id);
-      // Flush buffered tracer events. Without this, traces from the final
-      // session(s) before SIGTERM are silently dropped.
-      await tracer.shutdown();
-      await mcp.close();
+    shutdown() {
+      stopping = true;
+      shutdown ??= (async () => {
+        await Promise.all([...agentLoops.keys()].map((id) => engine.endAgentLoop(id)));
+        try {
+          await tracer.shutdown();
+        } finally {
+          await mcp.close();
+        }
+      })();
+      return shutdown;
     },
   };
 

@@ -91,6 +91,7 @@ mcp-tools/
 ## Stack
 
 - TypeScript (ESM, `module: Preserve`, `moduleResolution: Bundler`)
+- Effect 4 (`effect@4.0.0-rc.113`, pinned) for asynchronous orchestration
 - `@modelcontextprotocol/sdk` (stdio + StreamableHTTP transport)
 - `better-sqlite3` for Node code; `sqlite3` CLI from Bash for ad-hoc queries
 - `googleapis` + `google-auth-library` (Gmail)
@@ -194,6 +195,21 @@ business code.
    instantiate it in `server.ts main()`, pass to whoever needs it. Do
    not extend `NewsModule` with unrelated concerns just because PG is
    already there.
+
+9. **Use Effect for asynchronous orchestration.** Parallel tasks,
+   concurrency limits, cancellation, timeouts, retries/backoff and resource
+   cleanup should use Effect 4. Keep child tasks within their parent's
+   lifetime, propagate `AbortSignal` to SDK/HTTP calls and await finalizers
+   before closing traces or clients. Use `Effect.forEach` / `Effect.all`
+   with an explicit concurrency limit; convert to Promises at public API
+   boundaries. Keep the factory + DI structure above.
+
+   Reuse `packages/agent/src/generation.ts` for LLM generation/tracing and
+   `providers/retry.ts` for transient failures. Keep automatic retries in
+   one layer (SDK retries are disabled), and do not automatically replay
+   tool side effects. See `agent-loop.ts` and `workflow/execute.ts` for
+   existing patterns. Simple sequential SDK adapters can remain
+   `async`/`await`; add Effect when introducing orchestration.
 
 ### Anti-patterns (don't)
 

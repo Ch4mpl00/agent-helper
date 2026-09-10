@@ -1093,6 +1093,30 @@ describe("executor.execute — llm_agent step", () => {
 });
 
 describe("executor.execute — parallel step", () => {
+  it("interrupts a sibling after failure and prevents late writes to the store", async () => {
+    let finishSlow: (value: string) => void = () => { throw new Error("Slow tool has not started"); };
+    let slowSignal: AbortSignal | undefined;
+    const engine = makeMockEngine();
+    engine.mcp.callTool = async (name, _args, options) => {
+      if (name === "bad") throw new Error("failed branch");
+      slowSignal = options?.signal;
+      return new Promise<string>((resolve) => { finishSlow = resolve; });
+    };
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const result = await executor.execute({ version: 1, steps: [{
+      kind: "parallel", steps: [
+        { kind: "tool", tool: "bad", args: {} },
+        { kind: "tool", tool: "slow", args: {}, bind: "late" },
+      ],
+    }] }, ctx);
+    expect(result.ok).toBe(false);
+    expect(slowSignal?.aborted).toBe(true);
+    finishSlow("late success");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(ctx.store.has("late")).toBe(false);
+  });
+
   it("runs children concurrently and binds each", async () => {
     const order: string[] = [];
     const engine = makeMockEngine({

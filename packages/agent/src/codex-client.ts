@@ -22,17 +22,18 @@ export interface CodexRunResult {
 }
 
 export interface CodexClient {
-  run(req: CodexRunRequest): Promise<CodexRunResult>;
+  run(req: CodexRunRequest, options?: { signal?: AbortSignal }): Promise<CodexRunResult>;
 }
 
 export function createCodexClient(baseUrl = process.env.CODEX_URL ?? "http://localhost:3010"): CodexClient {
   const root = baseUrl.replace(/\/+$/, "");
   return {
-    async run(req) {
+    async run(req, options) {
       const res = await fetch(`${root}/run`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(req),
+        signal: options?.signal,
       });
       const body = await res.json() as { ok?: boolean; error?: string } & Partial<CodexRunResult>;
       if (!res.ok || body.ok !== true) {

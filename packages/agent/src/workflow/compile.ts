@@ -5,7 +5,10 @@ import type {
 import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
 import type { EnvData } from "../session-context";
-import type { Span, TokenUsage, TraceContext } from "../tracing";
+import type { Span, TraceContext } from "../tracing";
+import { Effect } from "effect";
+import { traceGenerationEffect } from "../generation";
+import { toError } from "../errors";
 import { JUDGE_NODE_META } from "../trace-model";
 import { appendPatch } from "../skills";
 import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
@@ -55,6 +58,7 @@ export interface PriorContext {
 }
 
 export interface CompileRequest {
+  abortSignal?: AbortSignal;
   signal: {
     source: string;
     content: string;
@@ -168,6 +172,7 @@ export function createCompiler(deps: CompilerDeps): Compiler {
           WorkflowSchema,
           compileSpan,
           maxAttempts,
+          req.abortSignal,
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -176,6 +181,16 @@ export function createCompiler(deps: CompilerDeps): Compiler {
       }
     },
   };
+}
+
+function parseGeneratedWorkflow(text: string, schema: Parameters<typeof parseWorkflow>[1]): ReturnType<typeof parseWorkflow> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return { ok: false, errors: [`invalid JSON: ${toError(error).message}`] };
+  }
+  return parseWorkflow(parsed, schema);
 }
 
 async function runRetryLoop(
@@ -187,6 +202,7 @@ async function runRetryLoop(
   schema: Parameters<typeof parseWorkflow>[1],
   compileSpan: Span,
   maxAttempts: number,
+  abortSignal?: AbortSignal,
 ): Promise<CompilerResult> {
   let attempts = 0;
   let lastErrors: string[] = [];
@@ -194,36 +210,30 @@ async function runRetryLoop(
   while (attempts < maxAttempts) {
     attempts++;
 
-    const gen = compileSpan.generation({
-      name: `attempt-${attempts}`,
-      model: preset.model,
-      input: messages,
-      modelParameters: { response_format: "json_object" },
-    });
-
-    let text: string;
-    let usage: TokenUsage | undefined;
+    let generated;
     try {
-      // The provider normalizes usage (incl. the cached-prompt portion that
-      // shows the static planner.md + tools + skills prefix hitting cache).
-      const result = await provider.complete({
-        model: preset.model,
-        messages,
-        reasoningEffort: preset.reasoningEffort,
-        responseFormat: { type: "json_object" },
-        // Transient-failure retries (withRetry decorator) show up as
-        // WARNING events on the compile span, next to attempt-N.
-        trace: compileSpan,
-      });
-      text = result.message.content ?? "";
-      usage = result.usage;
+      generated = await Effect.runPromise(traceGenerationEffect({
+        scope: compileSpan,
+        observation: {
+          name: `attempt-${attempts}`, model: preset.model, input: structuredClone(messages),
+          modelParameters: { response_format: "json_object" },
+        },
+        run: async (signal) => {
+          const result = await provider.complete({
+            model: preset.model, messages, reasoningEffort: preset.reasoningEffort,
+            responseFormat: { type: "json_object" }, trace: compileSpan, signal,
+          });
+          const text = result.message.content ?? "";
+          return { text, usage: result.usage, parsed: parseGeneratedWorkflow(text, schema) };
+        },
+        describe: ({ text, usage, parsed }) => ({
+          output: text, usage,
+          ...(parsed.ok ? { metadata: { [JUDGE_NODE_META]: "planner" } } : {}),
+        }),
+      }), { signal: abortSignal });
     } catch (err) {
+      abortSignal?.throwIfAborted();
       const message = err instanceof Error ? err.message : String(err);
-      gen.end({
-        output: { error: message },
-        level: "ERROR",
-        statusMessage: message,
-      });
       compileSpan.end({
         level: "ERROR",
         statusMessage: message,
@@ -232,32 +242,13 @@ async function runRetryLoop(
       return { ok: false, reason: "llm_error", errors: [message], attempts };
     }
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch (err) {
-      // Failed attempt — end UNtagged so the per-node judge skips it; only the
-      // accepted plan below is a judgeable planner node.
-      gen.end({ output: text, usage });
-      const errMsg = `invalid JSON: ${(err as Error).message}`;
-      lastErrors = [errMsg];
-      pushRetryFeedback(messages, text, lastErrors);
-      continue;
-    }
-
-    const result = parseWorkflow(parsed, schema);
+    const { text, parsed: result } = generated;
     if (result.ok) {
-      // Tag the ACCEPTED generation as the planner node for the per-node judge.
-      // Identity comes from this tag, never the name — `attempt-N` is
-      // display-only — and only the winning attempt carries it, so failed
-      // retries above never pollute the planner's per-skill scores.
-      gen.end({ output: text, usage, metadata: { [JUDGE_NODE_META]: "planner" } });
       compileSpan.end({ output: { attempts, ok: true } });
       return { ok: true, workflow: result.workflow, attempts };
     }
 
     // Schema-invalid attempt — also UNtagged (not judged), then retry.
-    gen.end({ output: text, usage });
     lastErrors = result.errors;
     pushRetryFeedback(messages, text, lastErrors);
   }

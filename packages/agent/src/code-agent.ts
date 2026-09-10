@@ -72,7 +72,7 @@ const SYSTEM_FRAMING =
 // synthetic-tools registry. Resolves to the trimmed final result; throws on a
 // Codex failure (the client rejects non-ok responses) — callers decide whether
 // that becomes a tool_error (workflow) or an error string (AgentLoop).
-export async function runCodeAgent(codex: CodexClient, args: CodeAgentArgs): Promise<string> {
+export async function runCodeAgent(codex: CodexClient, args: CodeAgentArgs, signal?: AbortSignal): Promise<string> {
   const result = await codex.run({
     prompt: `${SYSTEM_FRAMING}\n\nTask:\n${args.task}`,
     input: args.data,
@@ -81,6 +81,6 @@ export async function runCodeAgent(codex: CodexClient, args: CodeAgentArgs): Pro
     sandbox: "workspace-write",
     approvalPolicy: "never",
     timeoutMs: 120_000,
-  });
+  }, { signal });
   return result.content.trim();
 }

@@ -69,6 +69,7 @@ export interface WorkflowRunner {
     signal: WorkflowSignal,
     sessionContext: SessionContext,
     parentTrace: TraceContext,
+    abortSignal?: AbortSignal,
   ): Promise<WorkflowRunResult>;
 }
 
@@ -124,7 +125,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   const maxPasses = deps.maxPasses ?? 3;
 
   return {
-    async runForSignal(signal, sessionContext, parentTrace) {
+    async runForSignal(signal, sessionContext, parentTrace, abortSignal) {
       const envData = sessionContext.env;
       const signalLabel = `${signal.source}:${signal.id}`;
       // The plan→act→replan loop. Pass 0 is the initial plan; each `replan`
@@ -134,7 +135,9 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       let lastAttempts = 0;
 
       for (let pass = 0; pass < maxPasses; pass++) {
+        abortSignal?.throwIfAborted();
         const compiled = await compiler.compile({
+          abortSignal: abortSignal,
           signal: {
             source: signal.source,
             content: signal.content,
@@ -176,12 +179,14 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         });
 
         const executed = await executor.execute(compiled.workflow, {
+          abortSignal,
           sessionContext,
           store,
           parentTrace,
           signalLabel,
         });
 
+        abortSignal?.throwIfAborted();
         if (!executed.ok) {
           return {
             ok: false,

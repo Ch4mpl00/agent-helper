@@ -16,6 +16,7 @@
     "better-sqlite3": "^12.9.0",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
+    "effect": "4.0.0-rc.113",
     "openai": "^4.77.0",
     "zod": "^3.23.8",
     "zod-to-json-schema": "^3.24.1"

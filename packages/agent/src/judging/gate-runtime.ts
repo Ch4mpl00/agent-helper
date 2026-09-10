@@ -39,12 +39,12 @@ function toParam(m: ChatMessage): ChatCompletionMessageParam {
 // (planner emits JSON, composer prose).
 export async function runModel(messages: ChatMessage[], model: string, jsonMode: boolean): Promise<string> {
   const res = await retryOnTransient(
-    () =>
+    (signal) =>
       clientFor(model).chat.completions.create({
         model,
         messages: messages.map(toParam),
         ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
-      }),
+      }, { signal, maxRetries: 0 }),
     { maxRetries: 5, baseDelayMs: 3000 },
   );
   return res.choices[0]?.message.content ?? "";

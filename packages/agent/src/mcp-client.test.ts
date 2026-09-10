@@ -159,6 +159,37 @@ describe("connectWithRetry", () => {
 // with a usable handle after the first attempts fail, rather than throwing (the
 // throw is what reached `main().catch` → exit(1) → Docker restart).
 describe("connectMcp", () => {
+  it("forwards cancellation to an in-flight MCP request without reconnecting", async () => {
+    const server = new McpServer({ name: "cancel-test", version: "0.0.0" });
+    let started: () => void = () => {};
+    let cancelled: () => void = () => {};
+    const hasStarted = new Promise<void>((resolve) => { started = resolve; });
+    const hasCancelled = new Promise<void>((resolve) => { cancelled = resolve; });
+    server.registerTool("wait", { inputSchema: {} }, async (_args, extra) => {
+      started();
+      await new Promise<void>((resolve) => {
+        extra.signal.addEventListener("abort", () => { cancelled(); resolve(); }, { once: true });
+      });
+      return { content: [] };
+    });
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    let connections = 0;
+    const mcp = await connectMcp({ createTransport: () => { connections++; return clientSide; } });
+    try {
+      const controller = new AbortController();
+      const rejected = expect(mcp.callTool("wait", {}, { signal: controller.signal })).rejects.toBeDefined();
+      await hasStarted;
+      controller.abort();
+      await rejected;
+      await hasCancelled;
+      expect(connections).toBe(1);
+    } finally {
+      await mcp.close();
+      await server.close();
+    }
+  });
+
   const handles: Array<{ close(): Promise<void> }> = [];
 
   function liveTransport(): Transport {
